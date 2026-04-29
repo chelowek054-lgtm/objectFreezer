@@ -8,7 +8,7 @@ import torch
 
 from ..core.blueprint_io import save_blueprint_safetensors, update_index_json
 from ..core.geo import extract_geo
-from ..core.image_io import tensor_to_base64_png, vae_encode_all_frames, vae_encode_pool
+from ..core.image_io import tensor_to_base64_png, vae_encode_first_frame, vae_encode_pool
 from ..core.matrices import load_or_create_R
 from ..core.paths import blueprints_output_dir, sanitize_filename
 from ..core.text_encoder import (
@@ -52,8 +52,7 @@ class BlueprintCreator:
             "optional": {
                 "output_dir": ("STRING", {"default": ""}),
                 "seed": ("INT", {"default": 12345, "min": 0, "max": 2**31 - 1}),
-                # Full per-frame VAE latents [N,C,H,W]; pick active frame in Blueprint Injector.
-                "store_reference_latents": ("BOOLEAN", {"default": True}),
+                "num_text_tokens": ("INT", {"default": 16, "min": 1, "max": 256, "step": 1}),
             },
         }
 
@@ -72,23 +71,19 @@ class BlueprintCreator:
         object_class,
         output_dir="",
         seed=12345,
-        store_reference_latents=True,
+        num_text_tokens=16,
     ):
-        reference_latents_stack_f16 = None  # type: Optional[torch.Tensor]
-        reference_latents_meta = None  # type: Optional[Dict[str, Any]]
-        if store_reference_latents:
-            lat_stack = vae_encode_all_frames(images, vae)
-            reference_latents_stack_f16 = lat_stack.detach().half().cpu().contiguous()
-            _nb = int(reference_latents_stack_f16.shape[0])
-            reference_latents_meta = {
-                "tensor_key": "reference_latents_stack",
-                "layout": "[batch_frames, channels, height, width]",
-                "num_frames": _nb,
-                "channels": int(reference_latents_stack_f16.shape[1]),
-                "height_lat": int(reference_latents_stack_f16.shape[2]),
-                "width_lat": int(reference_latents_stack_f16.shape[3]),
-                "note": "Choose reference_frame_index in Blueprint Injector; Flux expects [1,C,H,W] per ref.",
-            }
+        lat_ref = vae_encode_first_frame(images, vae)
+        reference_latent_f16 = lat_ref.detach().half().cpu().contiguous()
+        reference_latent_meta = {
+            "tensor_key": "reference_latent",
+            "layout": "[batch, channels, height, width]",
+            "batch": 1,
+            "channels": int(reference_latent_f16.shape[1]),
+            "height_lat": int(reference_latent_f16.shape[2]),
+            "width_lat": int(reference_latent_f16.shape[3]),
+            "note": "Reference is mandatory; pick blueprint entry (index.json) in Blueprint Injector.",
+        }
 
         z_vision = vae_encode_pool(images, vae)
 
@@ -110,6 +105,10 @@ class BlueprintCreator:
         if text_seq.ndim != 3:
             raise RuntimeError("blueprint text seq expected [1,T,D], got {}".format(tuple(text_seq.shape)))
         blueprint_text_tokens = text_seq.detach().to(dtype=torch.float32, device="cpu").contiguous()
+        n_cap = int(num_text_tokens)
+        if n_cap < 1:
+            n_cap = 1
+        blueprint_text_tokens = blueprint_text_tokens[:, :n_cap, :].contiguous()
         _t = int(blueprint_text_tokens.shape[1])
         _d = int(blueprint_text_tokens.shape[-1])
         logger.info(
@@ -161,10 +160,8 @@ class BlueprintCreator:
             "d_face": int(_D_FACE),
             "d_total": int(z_hyb.shape[0]),
             "blueprint_text_tokens_shape": list(blueprint_text_tokens.shape),
-            "store_reference_latents": bool(store_reference_latents),
+            "reference_latent": reference_latent_meta,
         }
-        if reference_latents_meta is not None:
-            dims_payload["reference_latents_stack"] = reference_latents_meta
 
         metadata = {
             "object_id": str(object_id),
@@ -183,7 +180,7 @@ class BlueprintCreator:
             "seed_R_face": str(int(seed) + 1),
             "num_text_tokens": str(_t),
             "context_token_dim": "0",
-            "has_reference_latents_stack": "true" if reference_latents_stack_f16 is not None else "false",
+            "has_reference_latent": "true",
         }
 
         tensors = {
@@ -194,9 +191,8 @@ class BlueprintCreator:
             "z_hyb": z_hyb,
             "keyword_embedding": keyword_embedding,
             "blueprint_text_tokens": blueprint_text_tokens,
+            "reference_latent": reference_latent_f16,
         }
-        if reference_latents_stack_f16 is not None:
-            tensors["reference_latents_stack"] = reference_latents_stack_f16
 
         save_blueprint_safetensors(path, tensors=tensors, metadata=metadata)
         # Maintain index.json with VLM info and file references.
@@ -211,7 +207,7 @@ class BlueprintCreator:
             "keyword": str(keyword),
             "has_keyword_embedding": True,
             "has_blueprint_text_tokens": True,
-            "has_reference_latents_stack": reference_latents_stack_f16 is not None,
+            "has_reference_latent": True,
             "num_text_tokens": _t,
             "context_token_dim": 0,
             "details": details,

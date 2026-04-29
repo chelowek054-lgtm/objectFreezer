@@ -1,5 +1,6 @@
 import logging
 import os
+import json
 from typing import List, Optional
 
 import torch
@@ -9,7 +10,7 @@ import folder_paths
 from ..core.blueprint_io import (
     load_blueprint_text_tokens,
     load_keyword_embedding,
-    load_reference_latents_stack,
+    load_reference_latent,
     resolve_blueprint_from_index_json,
 )
 from ..core.matrices import load_or_create_W
@@ -70,6 +71,28 @@ def _resolve_blueprint_path(selection: str) -> str:
     return os.path.join(folder_paths.get_output_directory(), "blueprints", s)
 
 
+def _resolve_blueprint_from_index_json_at(index_json_path: str, entry_index: int) -> str:
+    """
+    Resolve a .blueprint path from an index.json by entry index.
+    If entry_index is out of range, it is clamped to [0, len(entries)-1].
+    """
+    p = str(index_json_path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(p)
+    with open(p, "r", encoding="utf-8") as f:
+        data = json.load(f)
+    entries = data.get("entries", None) if isinstance(data, dict) else None
+    if not isinstance(entries, list) or len(entries) == 0:
+        raise RuntimeError("index.json has no entries")
+    i_raw = int(entry_index)
+    i = max(0, min(i_raw, len(entries) - 1))
+    e = entries[i]
+    fname = e.get("file", None) if isinstance(e, dict) else None
+    if not isinstance(fname, str) or fname.strip() == "":
+        raise RuntimeError("index.json entry missing 'file' at index {}".format(i))
+    return os.path.join(os.path.dirname(p), fname), i_raw, i, len(entries)
+
+
 def _rebuild_txt_ids_for_new_length(
     txt_ids: torch.Tensor,
     L_new: int,
@@ -114,7 +137,7 @@ def _rebuild_txt_ids_for_new_length(
 def _blueprint_reference_latent_diffusion_wrapper(
     reference_latent_cpu: torch.Tensor,
     ref_latents_method_ui: str,
-    blueprint_scale: float,
+    ref_scale: float,
 ):
     """
     Flux ``diffusion_model`` wrapper: merge blueprint ``reference_latent`` into ``ref_latents``.
@@ -127,37 +150,54 @@ def _blueprint_reference_latent_diffusion_wrapper(
     """
 
     def _wrap(executor, *args, **kwargs):
-        x = args[0]
-        ref = reference_latent_cpu.to(device=x.device, dtype=x.dtype)
-        if blueprint_scale != 1.0:
-            ref = ref * float(blueprint_scale)
+        """
+        Flux passes ref_latents positionally into the wrapper stack; extra conds may also provide it
+        via kwargs. We must consolidate and call downstream without duplicate values.
+        """
+        if len(args) < 8:
+            return executor(*args, **kwargs)
+
+        x, timestep, context, y, guidance, ref_latents_pos, control, transformer_options = args[:8]
 
         kwargs = dict(kwargs)
-        kwargs.pop("ref_latents", None)
+        ref_latents_kw = kwargs.pop("ref_latents", None)
 
-        args_list = list(args)
-        existing = None
-        if len(args_list) >= 6:
-            existing = args_list[5]
-
-        merged_list = [ref]
-        if existing is not None:
+        existing_refs: list = []
+        for existing in (ref_latents_pos, ref_latents_kw):
+            if existing is None:
+                continue
             if isinstance(existing, list):
-                merged_list = existing + merged_list
+                existing_refs.extend(existing)
             else:
-                merged_list = [existing] + merged_list
+                existing_refs.append(existing)
 
-        if len(args_list) >= 6:
-            args_list[5] = merged_list
-        else:
-            kwargs["ref_latents"] = merged_list
+        my_refs: list = []
+        if isinstance(reference_latent_cpu, torch.Tensor):
+            ref = reference_latent_cpu.to(device=x.device, dtype=x.dtype)
+            if ref_scale != 1.0:
+                ref = ref * float(ref_scale)
+            my_refs.append(ref)
+
+        merged = existing_refs + my_refs
+        if len(merged) > 0:
+            kwargs["ref_latents"] = merged
 
         if ref_latents_method_ui == "index_timestep_zero":
             kwargs["ref_latents_method"] = "index_timestep_zero"
         else:
             kwargs["ref_latents_method"] = "offset"
 
-        return executor(*tuple(args_list), **kwargs)
+        # Call downstream using keywords so ref_latents is supplied exactly once.
+        return executor(
+            x,
+            timestep,
+            context,
+            y=y,
+            guidance=guidance,
+            control=control,
+            transformer_options=transformer_options,
+            **kwargs,
+        )
 
     return _wrap
 
@@ -331,6 +371,8 @@ class BlueprintPostInputPatch:
 class BlueprintInjector:
     CATEGORY = "blueprint"
 
+    _SEED_W_KW = 424242
+
     @classmethod
     def INPUT_TYPES(cls):
         files = _list_blueprints_input_dir()
@@ -344,15 +386,13 @@ class BlueprintInjector:
             },
             "optional": {
                 "self_attn_scale": ("FLOAT", {"default": 0.5, "min": -10.0, "max": 10.0, "step": 0.01, "advanced": True}),
-                "K_cross": ("FLOAT", {"default": 16.0, "min": 0.0, "max": 256.0, "step": 0.5, "advanced": True}),
-                "M_self": ("INT", {"default": 0, "min": 0, "max": 256, "step": 1, "advanced": True}),
-                "seed_W": ("INT", {"default": 424242, "min": 0, "max": 2**31 - 1, "advanced": True}),
                 "bp_tokens_position": (["append", "prepend"], {"default": "append", "advanced": True}),
                 "keyword_position": (
                     ["after_text", "before_text", "disabled"],
                     {"default": "after_text", "advanced": True},
                 ),
-                "inject_reference_latent": ("BOOLEAN", {"default": True, "advanced": True}),
+                "ref_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
+                # When blueprint_path is .index.json: selects entries[] index.
                 "reference_frame_index": (
                     "INT",
                     {"default": 0, "min": 0, "max": 8191, "step": 1, "advanced": True},
@@ -375,12 +415,9 @@ class BlueprintInjector:
         blueprint_scale=1.0,
         inject_self_attn=False,
         self_attn_scale=0.5,
-        K_cross=16.0,
-        M_self=0,
-        seed_W=424242,
         bp_tokens_position="append",
         keyword_position="after_text",
-        inject_reference_latent=True,
+        ref_scale=1.0,
         reference_frame_index=0,
         ref_latents_method="default",
         debug=False,
@@ -391,33 +428,33 @@ class BlueprintInjector:
             raise RuntimeError("blueprint_path is empty. Select a .index.json from the dropdown.")
 
         if resolved.lower().endswith(".index.json"):
-            resolved = resolve_blueprint_from_index_json(resolved)
+            # When an index.json is selected, reference_frame_index addresses entries[].
+            # This lets the user pick which saved blueprint instance to inject from.
+            bp_path, i_raw, i_used, n_entries = _resolve_blueprint_from_index_json_at(
+                resolved, entry_index=int(reference_frame_index)
+            )
+            if bool(debug) and i_raw != i_used:
+                logger.info(
+                    "[BlueprintInjector] index.json entry_index clamped: %s -> %s (valid 0..%s)",
+                    i_raw,
+                    i_used,
+                    max(0, n_entries - 1),
+                )
+            resolved = bp_path
+        else:
+            pass
 
         m = model.clone()
 
-        bp_stack = load_reference_latents_stack(resolved)
-        bp_ref = None  # type: Optional[torch.Tensor]
-        if bp_stack is not None:
-            ni = int(bp_stack.shape[0])
-            fi = max(0, min(int(reference_frame_index), ni - 1))
-            bp_ref = bp_stack[fi : fi + 1].contiguous()
+        bp_ref = load_reference_latent(resolved)  # required; raises if missing
 
         bp_text = load_blueprint_text_tokens(resolved)
 
         has_text = bp_text is not None and int(bp_text.shape[1]) >= 1
-        use_ref = (
-            bool(inject_reference_latent)
-            and bp_ref is not None
-            and float(blueprint_scale) != 0.0
-        )
+        use_text = has_text and float(blueprint_scale) > 0.0
+        use_ref = True
 
-        if not has_text and not use_ref:
-            logger.warning(
-                "[BlueprintInjector] %s has no usable blueprint_text_tokens and no reference latent; "
-                "nothing to inject.",
-                resolved,
-            )
-            return (m,)
+        # ref is required; load_reference_latent() raises if missing.
 
         kw = load_keyword_embedding(resolved)
         pos = str(bp_tokens_position).strip().lower()
@@ -440,30 +477,28 @@ class BlueprintInjector:
             logger.info("[BlueprintInjector] %s", _tensor_debug_line("reference_latent", bp_ref))
             logger.info("[BlueprintInjector] %s", _tensor_debug_line("keyword_emb", kw))
             logger.info(
-                "[BlueprintInjector] has_text=%s use_ref=%s inject_reference_latent=%s ref_latents_method=%s "
-                "reference_frame_index=%s stack_shape=%s "
-                "N_tokens=%s blueprint_scale=%s bp_tokens_position=%s keyword_position=%s K_cross(raw)=%s inject_self_attn=%s",
-                has_text,
+                "[BlueprintInjector] has_text=%s use_ref=%s ref_latents_method=%s "
+                "reference_frame_index=%s "
+                "ref_scale=%s N_tokens=%s blueprint_scale=%s bp_tokens_position=%s keyword_position=%s inject_self_attn=%s",
+                use_text,
                 use_ref,
-                bool(inject_reference_latent),
                 ref_ui,
                 int(reference_frame_index),
-                tuple(bp_stack.shape) if bp_stack is not None else None,
+                float(ref_scale),
                 int(bp_text.shape[1]) if has_text else 0,
                 float(blueprint_scale),
                 pos,
                 kw_pos,
-                K_cross,
                 inject_self_attn,
             )
 
-        if has_text:
+        if use_text:
             post_patch = BlueprintPostInputPatch(
                 model_patcher=m,
                 blueprint_text_tokens_cpu=bp_text,
                 keyword_embedding_cpu=kw,
                 blueprint_scale=float(blueprint_scale),
-                seed_W=int(seed_W),
+                seed_W=int(self._SEED_W_KW),
                 position=pos,
                 keyword_position=kw_pos,
                 debug=dbg,
@@ -475,25 +510,30 @@ class BlueprintInjector:
             logger.info("[BlueprintInjector] post_input skipped (no blueprint_text_tokens).")
 
         if use_ref:
+            rs = float(ref_scale)
+            if rs < 0.0:
+                rs = 0.0
+            if rs > 3.0:
+                rs = 3.0
             wrap = _blueprint_reference_latent_diffusion_wrapper(
                 bp_ref,
                 ref_ui,
-                float(blueprint_scale),
+                rs,
             )
             m.add_wrapper(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, wrap)
             if dbg:
                 logger.info(
                     "[BlueprintInjector] DIFFUSION_MODEL wrapper registered for reference_latent "
-                    "(shape=%s, method=%s).",
+                    "(shape=%s, method=%s, ref_scale=%s).",
                     tuple(bp_ref.shape),
                     ref_ui,
+                    rs,
                 )
 
         if inject_self_attn and dbg:
             logger.info(
                 "[BlueprintInjector] inject_self_attn=True ignored for Flux.2 joint attention "
-                "(M_self=%s self_attn_scale=%s).",
-                int(M_self),
+                "(self_attn_scale=%s).",
                 float(self_attn_scale),
             )
 

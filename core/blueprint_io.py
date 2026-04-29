@@ -70,10 +70,10 @@ def load_blueprint_text_tokens(blueprint_path: str) -> Optional[torch.Tensor]:
     return seq
 
 
-def load_reference_latents_stack(blueprint_path: str) -> Optional[torch.Tensor]:
+def load_reference_latent(blueprint_path: str) -> torch.Tensor:
     """
-    Per-frame reference latents ``reference_latents_stack``: [N, C, H, W], float16/float32 CPU, N >= 1.
-    Missing → None.
+    Required reference latent ``reference_latent``: [1, C, H, W], float16/float32 CPU.
+    Missing → RuntimeError.
     """
     p = str(blueprint_path)
     if not os.path.exists(p):
@@ -84,19 +84,23 @@ def load_reference_latents_stack(blueprint_path: str) -> Optional[torch.Tensor]:
     safetensors = require_safetensors()
     t = safetensors.torch.load_file(p, device="cpu")
 
-    if "reference_latents_stack" not in t:
-        return None
+    if "reference_latent" not in t:
+        raise RuntimeError(
+            "safetensors blueprint missing required tensor 'reference_latent' (re-export with Blueprint Creator)"
+        )
 
-    lat = t["reference_latents_stack"]
+    lat = t["reference_latent"]
     if not isinstance(lat, torch.Tensor):
-        return None
+        raise RuntimeError("reference_latent is not a tensor")
     lat = lat.detach().to(device="cpu").contiguous()
     if lat.ndim == 3:
         lat = lat.unsqueeze(0)
     if lat.ndim != 4:
         raise RuntimeError(
-            "reference_latents_stack must be [N,C,H,W] or [C,H,W], got {}".format(tuple(lat.shape))
+            "reference_latent must be [1,C,H,W] or [C,H,W], got {}".format(tuple(lat.shape))
         )
+    if int(lat.shape[0]) != 1:
+        raise RuntimeError("reference_latent must have batch==1, got shape {}".format(tuple(lat.shape)))
     return lat
 
 

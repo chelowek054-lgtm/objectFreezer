@@ -43,6 +43,21 @@ def vae_encode_all_frames(images: torch.Tensor, vae: Any) -> torch.Tensor:
         raise ValueError("Unexpected VAE latent shape: {}".format(tuple(latent.shape)))
     return latent.detach().float().contiguous()
 
+def vae_encode_first_frame(images: torch.Tensor, vae: Any) -> torch.Tensor:
+    """
+    Encode the first IMAGE row to latent [1, C, H_lat, W_lat] float32.
+    images: ComfyUI IMAGE [N, H, W, C] float [0..1], N>=1.
+    """
+    if images.ndim != 4:
+        raise ValueError("Expected IMAGE tensor [N,H,W,C], got {}".format(tuple(images.shape)))
+    if int(images.shape[0]) < 1:
+        raise ValueError("Expected at least 1 IMAGE frame, got N=0")
+    pixels = images[:1, :, :, :3]
+    latent = vae.encode(pixels)
+    if latent.ndim != 4:
+        raise ValueError("Unexpected VAE latent shape: {}".format(tuple(latent.shape)))
+    return latent.detach().float().contiguous()
+
 
 def vae_encode_pool(images: torch.Tensor, vae: Any) -> torch.Tensor:
     """

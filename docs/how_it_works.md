@@ -10,13 +10,13 @@
 | **Blueprint Injector (patch model)** | [`BlueprintInjector`](../nodes/blueprint_injector.py) |
 | **Blueprint Path (Output)** | [`BlueprintPathOutput`](../nodes/blueprint_outputs.py) |
 
-Пакет не модифицирует исходники ComfyUI: текстовые токены blueprint подмешиваются через **`ModelPatcher.set_model_post_input_patch`** (Flux `post_input`); опционально **`reference_latents_stack`** подмешивается в **`diffusion_model`** через **`WrappersMP.DIFFUSION_MODEL`**.
+Пакет не модифицирует исходники ComfyUI: текстовые токены blueprint подмешиваются через **`ModelPatcher.set_model_post_input_patch`** (Flux `post_input`); обязательный **`reference_latent`** подмешивается в **`diffusion_model`** через **`WrappersMP.DIFFUSION_MODEL`**.
 
 ---
 
 ## 1. Blueprint Creator
 
-Строит файл **`.blueprint`** (safetensors): `z_hyb`, текстовые токены **`blueprint_text_tokens`** (сырой выход TE без проекций), **`keyword_embedding`**, опционально **`reference_latents_stack`** `[N,C,H,W]` (float16), один латент на каждый кадр входного `IMAGE`.
+Строит файл **`.blueprint`** (safetensors): `z_hyb`, текстовые токены **`blueprint_text_tokens`** (сырой выход TE без проекций), **`keyword_embedding`**, обязательный **`reference_latent`** `[1,C,H,W]` (float16), берётся из первого кадра входного `IMAGE`.
 
 ### Входы (сводка)
 
@@ -28,9 +28,9 @@
 | `object_id`, `object_class` | Папка под `output/blueprints`, префикт текста, влияет на поля VLM. |
 | `output_dir` | Базовый каталог (пусто — см. [`paths.py`](../core/paths.py)). |
 | `seed` | Сиды проекций `R_sem`, `R_face`. |
-| `store_reference_latents` | Сохранять ли **`reference_latents_stack`** (кадр выбирается в Injector). |
+| (нет) | Референс всегда сохраняется как **`reference_latent`**. |
 
-Ключи тензоров в файле: `z_vision`, `z_sem`, `z_geo`, `z_face`, `z_hyb`, `keyword_embedding`, `blueprint_text_tokens`, опционально **`reference_latents_stack`**.
+Ключи тензоров в файле: `z_vision`, `z_sem`, `z_geo`, `z_face`, `z_hyb`, `keyword_embedding`, `blueprint_text_tokens`, **`reference_latent`**.
 
 Текстовые токены: [`encode_blueprint_text_tokens_for_diffusion`](../core/text_encoder.py) → float32 CPU **`[1, T, D]`** (например Klein **D=12288**).
 
@@ -41,7 +41,7 @@
 ## 2. Blueprint Injector
 
 - **`blueprint_text_tokens`**: [`load_blueprint_text_tokens`](../core/blueprint_io.py) — ключ **`blueprint_text_tokens`**. После **`txt_norm`** / **`txt_in`** конкатенируются к `txt` сцены; последняя размерность должна совпадать с **`txt_in.in_features`** (например 12288 для Klein).
-- **`reference_latents_stack`**: [`load_reference_latents_stack`](../core/blueprint_io.py) — ключ **`reference_latents_stack`**. Индекс кадра: **`reference_frame_index`** (clamp к `[0, N-1]`). Подмешивание в **`ref_latents`** метода Flux; режим **`ref_latents_method`**: `default` → во Flux **`offset`**, `index_timestep_zero` → **`index_timestep_zero`**.
+- **`reference_latent`**: [`load_reference_latent`](../core/blueprint_io.py) — ключ **`reference_latent`**. Если выбран `.index.json`, то **`reference_frame_index`** выбирает `entries[]` (какой `.blueprint` взять). Подмешивание в **`ref_latents`** Flux; режим **`ref_latents_method`**: `default` → во Flux **`offset`**, `index_timestep_zero` → **`index_timestep_zero`**.
 
 | Параметр | Смысл |
 |----------|--------|
