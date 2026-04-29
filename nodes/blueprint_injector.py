@@ -138,6 +138,13 @@ def _blueprint_reference_latent_diffusion_wrapper(
     reference_latent_cpu: torch.Tensor,
     ref_latents_method_ui: str,
     ref_scale: float,
+    sigmas_cpu: Optional[torch.Tensor],
+    ref_start_step: int,
+    ref_stage1_end_pct: float,
+    ref_stage2_end_pct: float,
+    ref_scale_stage1: float,
+    ref_scale_stage2: float,
+    ref_scale_stage3: float,
 ):
     """
     Flux ``diffusion_model`` wrapper: merge blueprint ``reference_latent`` into ``ref_latents``.
@@ -162,6 +169,20 @@ def _blueprint_reference_latent_diffusion_wrapper(
         kwargs = dict(kwargs)
         ref_latents_kw = kwargs.pop("ref_latents", None)
 
+        # Optional step index logging / gating (use nearest match; equality is brittle in float land)
+        step_idx = None
+        step_total = None
+        if sigmas_cpu is not None and isinstance(timestep, torch.Tensor) and sigmas_cpu.numel() > 0:
+            try:
+                t0 = float(timestep.detach().reshape(-1)[0].item())
+                sig = sigmas_cpu.detach().reshape(-1).to(dtype=torch.float32)
+                dif = (sig - t0).abs()
+                step_idx = int(dif.argmin().item())
+                step_total = int(sig.numel() - 1)
+            except Exception:
+                step_idx = None
+                step_total = None
+
         existing_refs: list = []
         for existing in (ref_latents_pos, ref_latents_kw):
             if existing is None:
@@ -172,10 +193,42 @@ def _blueprint_reference_latent_diffusion_wrapper(
                 existing_refs.append(existing)
 
         my_refs: list = []
-        if isinstance(reference_latent_cpu, torch.Tensor):
+        allow_ref = True
+        if step_idx is not None and int(ref_start_step) > 0:
+            allow_ref = step_idx >= int(ref_start_step)
+
+        stage_mul = 1.0
+        stage_id = None
+        if step_idx is not None and step_total is not None and step_total > 0:
+            p = float(step_idx) / float(step_total)
+            s1 = float(ref_stage1_end_pct)
+            s2 = float(ref_stage2_end_pct)
+            if s1 < 0.0:
+                s1 = 0.0
+            if s1 > 1.0:
+                s1 = 1.0
+            if s2 < 0.0:
+                s2 = 0.0
+            if s2 > 1.0:
+                s2 = 1.0
+            if s2 < s1:
+                s2 = s1
+
+            if p <= s1:
+                stage_id = 1
+                stage_mul = float(ref_scale_stage1)
+            elif p <= s2:
+                stage_id = 2
+                stage_mul = float(ref_scale_stage2)
+            else:
+                stage_id = 3
+                stage_mul = float(ref_scale_stage3)
+
+        if allow_ref and isinstance(reference_latent_cpu, torch.Tensor):
             ref = reference_latent_cpu.to(device=x.device, dtype=x.dtype)
-            if ref_scale != 1.0:
-                ref = ref * float(ref_scale)
+            eff = float(ref_scale) * float(stage_mul)
+            if eff != 1.0:
+                ref = ref * eff
             my_refs.append(ref)
 
         merged = existing_refs + my_refs
@@ -186,6 +239,16 @@ def _blueprint_reference_latent_diffusion_wrapper(
             kwargs["ref_latents_method"] = "index_timestep_zero"
         else:
             kwargs["ref_latents_method"] = "offset"
+
+        if step_idx is not None:
+            logger.info(
+                "[BlueprintInjector] step %s/%s stage=%s ref_enabled=%s (ref_start_step=%s)",
+                step_idx,
+                step_total,
+                stage_id,
+                bool(allow_ref),
+                int(ref_start_step),
+            )
 
         # Call downstream using keywords so ref_latents is supplied exactly once.
         return executor(
@@ -385,6 +448,7 @@ class BlueprintInjector:
                 "inject_self_attn": ("BOOLEAN", {"default": False}),
             },
             "optional": {
+                "sigmas": ("SIGMAS",),
                 "self_attn_scale": ("FLOAT", {"default": 0.5, "min": -10.0, "max": 10.0, "step": 0.01, "advanced": True}),
                 "bp_tokens_position": (["append", "prepend"], {"default": "append", "advanced": True}),
                 "keyword_position": (
@@ -392,6 +456,12 @@ class BlueprintInjector:
                     {"default": "after_text", "advanced": True},
                 ),
                 "ref_scale": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1}),
+                "ref_start_step": ("INT", {"default": 0, "min": 0, "max": 4096, "step": 1, "advanced": True}),
+                "ref_stage1_end_pct": ("FLOAT", {"default": 0.33, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
+                "ref_stage2_end_pct": ("FLOAT", {"default": 0.66, "min": 0.0, "max": 1.0, "step": 0.01, "advanced": True}),
+                "ref_scale_stage1": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1, "advanced": True}),
+                "ref_scale_stage2": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1, "advanced": True}),
+                "ref_scale_stage3": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 3.0, "step": 0.1, "advanced": True}),
                 # When blueprint_path is .index.json: selects entries[] index.
                 "reference_frame_index": (
                     "INT",
@@ -414,10 +484,17 @@ class BlueprintInjector:
         blueprint_path,
         blueprint_scale=1.0,
         inject_self_attn=False,
+        sigmas=None,
         self_attn_scale=0.5,
         bp_tokens_position="append",
         keyword_position="after_text",
         ref_scale=1.0,
+        ref_start_step=0,
+        ref_stage1_end_pct=0.33,
+        ref_stage2_end_pct=0.66,
+        ref_scale_stage1=1.0,
+        ref_scale_stage2=1.0,
+        ref_scale_stage3=1.0,
         reference_frame_index=0,
         ref_latents_method="default",
         debug=False,
@@ -515,10 +592,20 @@ class BlueprintInjector:
                 rs = 0.0
             if rs > 3.0:
                 rs = 3.0
+            sig_cpu = None
+            if isinstance(sigmas, torch.Tensor):
+                sig_cpu = sigmas.detach().to(device="cpu", dtype=torch.float32).contiguous()
             wrap = _blueprint_reference_latent_diffusion_wrapper(
                 bp_ref,
                 ref_ui,
                 rs,
+                sig_cpu,
+                int(ref_start_step),
+                float(ref_stage1_end_pct),
+                float(ref_stage2_end_pct),
+                float(ref_scale_stage1),
+                float(ref_scale_stage2),
+                float(ref_scale_stage3),
             )
             m.add_wrapper(comfy.patcher_extension.WrappersMP.DIFFUSION_MODEL, wrap)
             if dbg:
